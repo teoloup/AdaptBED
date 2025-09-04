@@ -13,6 +13,7 @@ Adaptive sampling BED helper built on pybedtools (0.12.0) with chrom sizes from 
 - Clamps to chromosome bounds using bioframe chromsizes.
 - Optional buffer auto-calculation from mean and CV using a log-normal model (Nxx); prints and records N50/N25/N15/N10/N01 and picks N15 by default.
 - Final adaptive bed keeps distinct names in column 4.
+- Based on guidelines from ONT Adaptive sampling guide (https://nanoporetech.com/document/adaptive-sampling#where-to-find-create-and-modify-fasta-and-bed-files)
 
 ## Install
 
@@ -74,4 +75,4 @@ Given merged ROI size S and count N, requested buffer B:
 ## License
 
 MIT
-# bed-buffer-tool (argparse scaffold)
+
