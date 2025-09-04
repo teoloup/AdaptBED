@@ -1,0 +1,34 @@
+[build-system]
+requires = ["hatchling>=1.24.2"]
+build-backend = "hatchling.build"
+
+[project]
+name = "adaptbed"
+version = "0.1.0"
+description = "AdaptBED — adaptive-sampling BED formatter."
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "MIT" }
+authors = [{ name = "Your Name" }]
+keywords = ["BED", "genomics", "pybedtools", "bioinformatics"]
+dependencies = [
+  "pybedtools==0.12.0",
+  "typing-extensions>=4.7; python_version < \"3.9\"",
+  "bioframe>=0.6",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0", "ruff>=0.5", "black>=24.0"]
+
+[project.scripts]
+adaptbed = "bed_buffer_tool.__main__:main"
+
+[tool.black]
+line-length = 100
+target-version = ["py38"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py38"
+select = ["E", "F", "I"]
+ignore = []

@@ -1,0 +1,14 @@
+metric	key	value
+roi	count	437
+roi	total_bp	39714909
+roi	mean_bp	90880.80
+roi	median_bp	38997.00
+roi	genome_size_bp	3088286401
+roi	percent_genome	1.285985
+adaptive	count	429
+adaptive	total_bp	44024724
+adaptive	mean_bp	102621.73
+adaptive	median_bp	49478.00
+adaptive	genome_size_bp	3088286401
+adaptive	percent_genome	1.425539
+meta	buffer_size_used	5000
