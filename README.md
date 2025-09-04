@@ -28,11 +28,9 @@ This will install dependencies:
 - pybedtools==0.12.0
 - bioframe>=0.6
 
-Note: On Windows, pybedtools relies on pure Python operations in this project; no bedtools binary is required.
-
 ## Usage
 
-```powershell
+```
 # Basic
 adaptbed -i input.bed -o outdir --prefix sample
 
@@ -77,15 +75,3 @@ Given merged ROI size S and count N, requested buffer B:
 
 MIT
 # bed-buffer-tool (argparse scaffold)
-
-Python >=3.8 CLI for BED manipulation (buffering, etc.). This scaffold includes argument parsing and validation only.
-
-## Install (local)
-# optional, installs console script `bed-buffer-tool`
-pip install -e .
-
-## Usage
-bed-buffer-tool --input input.bed --output outdir --prefix sample --sort true --strand-aware-buffer --genome hg38 --buffer-size 5000
-
-# Calculate buffer mode
-bed-buffer-tool -i input.bed -o outdir --prefix sample --calculate-buffer --mean-length 350 --cv 12.5
