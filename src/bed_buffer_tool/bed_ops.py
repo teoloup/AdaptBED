@@ -1,6 +1,4 @@
 """
-BED processing utilities implemented exactly as specified.
-
 Pipeline steps:
 - Accept BED3/6/12 input and normalize to BED6 for processing (name if exists; score=0; strand as specified).
 - Parse, sort, and merge (not strand-aware) to produce the ROI BED (bed6) with strand set to '.'; keep names if present (distinct names collapsed).
@@ -18,19 +16,17 @@ Pipeline steps:
 
 Notes:
 - Starts are clamped to 0 and ends are clamped to chromosome sizes from bioframe.fetch_chromsizes.
-- pybedtools 0.12.0 is used; no direct bedtools binary checks are performed per user instruction.
 """
 
 from __future__ import annotations
-
 from dataclasses import dataclass
 import math
 from pathlib import Path
 from statistics import mean, median
 from typing import Iterable, List, Tuple, Dict, Optional
 import bioframe as bf
-import pybedtools  # type: ignore
-from pybedtools import BedTool  # type: ignore
+import pybedtools  
+from pybedtools import BedTool  
 from statistics import NormalDist
 
 
