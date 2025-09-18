@@ -108,6 +108,23 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Ignore buffer 3x cap (may greatly increase target size)",
     )
+    p.add_argument(
+        "--mask-repeat-regions",
+        action="store_true",
+        help="Mask repeat regions in adaptive BED that overlap with regions >= chunk-size",
+    )
+    p.add_argument(
+        "--chunk-size",
+        type=positive_int,
+        default=400,
+        help="Minimum repeat region size to consider for masking (default: 400 bp)",
+    )
+    p.add_argument(
+        "--cache-dir",
+        type=str,
+        help="Custom directory for caching genomic data (RepeatMasker, chromsizes). "
+             "If not specified, uses .adaptbed_cache in project directory",
+    )
 
     return p
 
@@ -175,12 +192,16 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(f"Requested buffer-size: {requested_buffer} bp")
 
     # Run processing pipeline (it may apply a global cap)
+    custom_cache_dir = Path(args.cache_dir) if args.cache_dir else None
     outputs = run_pipeline(
         input_bed_path=Path(args.input),
         genome=args.genome or "hg38",
         buffer_size=requested_buffer,
         ignore_cap=bool(args.ignore_cap),
         strand_aware_buffer=bool(args.strand_aware_buffer),
+        mask_repeats=bool(args.mask_repeat_regions),
+        chunk_size=args.chunk_size,
+        custom_cache_dir=custom_cache_dir,
     )
 
     # Report buffer actually used
@@ -225,6 +246,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         fmt_stats("roi", outputs.roi_stats),
         fmt_stats("adaptive", outputs.adaptive_stats),
         f"meta\tbuffer_size_used\t{outputs.buffer_size_used}",
+        f"meta\trepeat_regions_count\t{outputs.repeat_regions_count}",
+        f"meta\trepeat_bases_masked\t{outputs.repeat_bases_masked}",
     ]
 
     # Include Nxx meta if calculated
@@ -253,6 +276,9 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     for w in outputs.clamp_warnings:
         print(f"Warning: {w}")
+
+    for w in outputs.repeat_warnings:
+        print(f"Repeat: {w}")
 
     print(f"Written: {roi_path}")
     print(f"Written: {adaptive_path}")

@@ -18,7 +18,7 @@ Pipeline steps:
 
 Notes:
 - Starts are clamped to 0 and ends are clamped to chromosome sizes from bioframe.fetch_chromsizes.
-- pybedtools 0.12.0 is used; no direct bedtools binary checks are performed per user instruction.
+- Uses bioframe for BED operations (merge, overlap, subtract) for reliability and cross-platform compatibility.
 """
 
 from __future__ import annotations
@@ -29,11 +29,216 @@ from pathlib import Path
 from statistics import mean, median
 from typing import Iterable, List, Tuple, Dict, Optional
 import bioframe as bf
-import pybedtools  # type: ignore
-from pybedtools import BedTool  # type: ignore
+import pandas as pd
 from statistics import NormalDist
+from pybedtools import BedTool  # type: ignore
+
+import os
+import gzip
+import tempfile
+import requests
 
 
+# ---------- Bioframe-based BED operations (reliable and cross-platform) ----------
+
+def _bedframe_from_bedtool(bt):
+    """Convert BedTool to bioframe-compatible DataFrame."""
+    rows = []
+    for feature in bt:
+        rows.append({
+            'chrom': feature.chrom,
+            'start': int(feature.start),
+            'end': int(feature.end),
+            'name': feature.name if hasattr(feature, 'name') and feature.name != '.' else f'interval_{len(rows)}',
+            'score': getattr(feature, 'score', 0),
+            'strand': getattr(feature, 'strand', '.')
+        })
+    return pd.DataFrame(rows)
+
+
+def _bedtool_from_bedframe(df: pd.DataFrame):
+    """Convert bioframe DataFrame back to BedTool format."""
+    lines = []
+    for _, row in df.iterrows():
+        # Handle missing columns with defaults
+        name = row.get('name', '.')
+        score = row.get('score', 0)
+        strand = row.get('strand', '.')
+        
+        line = f"{row['chrom']}\t{int(row['start'])}\t{int(row['end'])}\t{name}\t{score}\t{strand}"
+        lines.append(line)
+    
+    data = "\n".join(lines)
+    return BedTool(data, from_string=True)
+
+
+def _get_cached_chromsizes(genome: str, custom_cache_dir: Optional[Path] = None):
+    """Get chromosome sizes, using cache when available."""
+    cache_dir = _get_cache_dir(custom_cache_dir)
+    chromsizes_file = cache_dir / f"{genome}_chromsizes.tsv"
+
+    # Try to load from cache first
+    if chromsizes_file.exists():
+        try:
+            chromsizes_df = pd.read_csv(chromsizes_file, sep='\t', index_col=0, header=None, names=['size'])
+            chromsizes_series = chromsizes_df['size']
+            print(f"Using cached chromosome sizes for {genome}")
+            return chromsizes_series
+        except Exception as e:
+            print(f"Warning: Could not load cached chromsizes ({e}), fetching fresh data...")
+
+    # Fetch from bioframe and cache
+    print(f"Fetching chromosome sizes for {genome} from bioframe...")
+    chromsizes_series = bf.fetch_chromsizes(genome)
+
+    # Cache the result
+    try:
+        chromsizes_df = chromsizes_series.to_frame()
+        chromsizes_df.to_csv(chromsizes_file, sep='\t', header=False)
+        print(f"Cached chromosome sizes to {chromsizes_file}")
+    except Exception as e:
+        print(f"Warning: Could not cache chromsizes ({e})")
+
+    return chromsizes_series
+
+def _get_cache_dir(custom_cache_dir: Optional[Path] = None) -> Path:
+    """Get the cache directory for storing genomic data."""
+    if custom_cache_dir is not None:
+        cache_dir = Path(custom_cache_dir)
+    else:
+        # Use cache directory within the project folder
+        # More robust approach: find the script's directory and go up to project root
+        script_dir = Path(__file__).parent  # src/bed_buffer_tool
+        project_root = script_dir.parent.parent  # Go up to project root
+        cache_dir = project_root / ".adaptbed_cache"
+
+    cache_dir.mkdir(exist_ok=True, parents=True)
+    return cache_dir
+
+
+def _download_repeatmasker(genome: str, custom_cache_dir: Optional[Path] = None) -> Path:
+    """Download RepeatMasker data from UCSC and cache it locally."""
+    cache_dir = _get_cache_dir(custom_cache_dir)
+    genome_dir = cache_dir / genome
+    genome_dir.mkdir(exist_ok=True)
+    rmsk_file = genome_dir / "rmsk.bed.gz"
+
+    if rmsk_file.exists():
+        print(f"Using cached RepeatMasker data: {rmsk_file}")
+        return rmsk_file
+
+    # Download from UCSC with progress reporting
+    url = f"https://hgdownload.soe.ucsc.edu/goldenPath/{genome}/database/rmsk.txt.gz"
+    print(f"Downloading RepeatMasker data for {genome} from UCSC...")
+
+    # Use streaming download to show progress
+    response = requests.get(url, stream=True)
+    response.raise_for_status()
+
+    total_size = int(response.headers.get('content-length', 0))
+    downloaded_size = 0
+
+    # Save compressed with progress reporting
+    with open(rmsk_file, 'wb') as f:
+        for chunk in response.iter_content(chunk_size=8192):
+            if chunk:
+                f.write(chunk)
+                downloaded_size += len(chunk)
+
+                # Progress reporting
+                if total_size > 0:
+                    progress = (downloaded_size / total_size) * 100
+                    print(f"\rDownload progress: {progress:.1f}%", end='', flush=True)
+                else:
+                    # If no content-length header, show bytes downloaded
+                    if downloaded_size % (1024 * 1024) == 0:  # Every MB
+                        mb_downloaded = downloaded_size / (1024 * 1024)
+                        print(f"\rDownloaded: {mb_downloaded:.1f} MB", end='', flush=True)
+
+    print("\nDownload complete!")
+    return rmsk_file
+
+
+def _load_repeatmasker_bed(genome: str, min_size: int = 400, custom_cache_dir: Optional[Path] = None) -> BedTool:
+    """Load RepeatMasker data as BedTool, filtering by minimum size."""
+    rmsk_file = _download_repeatmasker(genome, custom_cache_dir)
+
+    print(f"Loading repeat data from {rmsk_file}...")
+
+    # Read the gzipped TSV file with progress reporting
+    with gzip.open(rmsk_file, 'rt') as f:
+        # Skip header if present, parse TSV
+        lines = []
+        processed_count = 0
+        filtered_count = 0
+
+        for line_num, line in enumerate(f, 1):
+            if line.startswith('#'):
+                continue
+
+            fields = line.strip().split('\t')
+            if len(fields) < 8:
+                continue
+
+            processed_count += 1
+
+            # Progress reporting every 100k lines
+            if processed_count % 100000 == 0:
+                print(f"Processed {processed_count:,} repeat annotations, filtered {filtered_count:,}...")
+
+            chrom, start, end = fields[5], fields[6], fields[7]  # Correct field indices
+            size = int(end) - int(start)
+
+            if size >= min_size:
+                filtered_count += 1
+                # Convert to BED6: chrom, start, end, name, score, strand
+                name = fields[10] if len(fields) > 10 else "repeat"  # repName
+                score = fields[1] if len(fields) > 1 else "0"  # swScore
+                strand = fields[8] if len(fields) > 8 else "."  # strand
+                lines.append(f"{chrom}\t{start}\t{end}\t{name}\t{score}\t{strand}")
+
+        print(f"Completed: processed {processed_count:,} annotations, kept {filtered_count:,} repeats >= {min_size}bp")
+
+    # Create BedTool from lines
+    if lines:
+        print(f"Creating BedTool with {len(lines):,} repeat regions...")
+        return _bedtool_from_lines(lines)
+    else:
+        print("No repeat regions found matching criteria")
+        # Return empty BedTool
+        return _bedtool_from_lines([])
+
+
+def _mask_repeats_in_bed(adaptive_bed: BedTool, repeats_bed: BedTool) -> Tuple[BedTool, int]:
+    """Mask repeats in adaptive BED by subtracting overlaps. Returns masked BED and bases removed."""
+    if len(repeats_bed) == 0:
+        return adaptive_bed, 0
+
+    print(f"Starting repeat masking: {len(adaptive_bed)} adaptive regions, {len(repeats_bed)} repeat regions")
+
+    # Convert to bioframe DataFrames for operations
+    print("Converting to bioframe DataFrames...")
+    adaptive_df = _bedframe_from_bedtool(adaptive_bed)
+    repeats_df = _bedframe_from_bedtool(repeats_bed)
+
+    # Get original size
+    original_size = int((adaptive_df['end'] - adaptive_df['start']).sum())
+    print(f"Original adaptive BED size: {original_size:,} bp")
+
+    # Use bioframe subtract
+    print("Performing bioframe subtract operation...")
+    masked_df = bf.subtract(adaptive_df, repeats_df)
+
+    # Calculate bases removed
+    masked_size = int((masked_df['end'] - masked_df['start']).sum())
+    bases_removed = original_size - masked_size
+
+    print(f"Repeat masking completed: removed {bases_removed:,} bp, final size: {masked_size:,} bp")
+
+    # Convert back to BedTool
+    masked_bed = _bedtool_from_bedframe(masked_df)
+
+    return masked_bed, bases_removed
 # ---------- Small helpers ----------
 
 def _interval_len(fields: List[str]) -> int:
@@ -50,7 +255,7 @@ def _to_bed6_lines(bt: BedTool) -> List[str]:
 
 	lines: List[str] = []
 	for f in bt:
-		fields = list(f.fields)
+		fields = f.fields
 		chrom = fields[0]
 		start = int(fields[1])
 		end = int(fields[2])
@@ -62,9 +267,9 @@ def _to_bed6_lines(bt: BedTool) -> List[str]:
 
 
 def _bedtool_from_lines(lines: List[str]) -> BedTool:
-	# Construct a BedTool from in-memory lines
-	data = "\n".join(lines) + ("\n" if lines and not lines[-1].endswith("\n") else "")
-	return BedTool(data, from_string=True)
+    # Construct a BedTool from in-memory lines
+    data = "\n".join(lines) + ("\n" if lines and not lines[-1].endswith("\n") else "")
+    return BedTool(data, from_string=True)
 
 
 def _merge_roi_bed6(bt6: BedTool) -> BedTool:
@@ -73,25 +278,43 @@ def _merge_roi_bed6(bt6: BedTool) -> BedTool:
 	Output columns: chrom, start, end, name, score=0, strand='.'.
 	"""
 
-	# Always sort before merging for correctness
-	bt_sorted = bt6.sort()
+	# Convert to bioframe DataFrame
+	df = _bedframe_from_bedtool(bt6)
+	
+	# Sort the DataFrame
+	df_sorted = bf.sort_bedframe(df)
+	
+	# First, merge overlapping intervals (only chrom, start, end)
+	merged_df = bf.merge(df_sorted)
+	
+	# For each merged interval, collect names from overlapping original intervals
+	final_rows = []
+	for _, merged_row in merged_df.iterrows():
+		chrom, start, end = merged_row['chrom'], merged_row['start'], merged_row['end']
+		
+		# Find original intervals that overlap with this merged interval
+		overlaps = bf.overlap(df_sorted, pd.DataFrame({
+			'chrom': [chrom], 'start': [start], 'end': [end]
+		}))
+		
+		# Collect unique names from overlapping intervals
+		names = overlaps['name'].unique() if len(overlaps) > 0 else []
+		name_str = ','.join(names) if len(names) > 0 else '.'
+		
+		final_rows.append({
+			'chrom': chrom,
+			'start': int(start),
+			'end': int(end),
+			'name': name_str,
+			'score': 0,
+			'strand': '.'
+		})
+	
+	final_df = pd.DataFrame(final_rows)
+	return _bedtool_from_bedframe(final_df)
 
-	# Merge overlapping intervals; collapse distinct names if present.
-	# Input is bed6, so column 4 holds names. After merge with c=4, o=distinct, the output
-	# has bed3 + a 4th column containing the distinct names.
-	merged = bt_sorted.merge(c=[4], o=["distinct"])  # type: ignore[arg-type]
 
-	# Reconstruct bed6 lines with name from merged 4th column, score=0, strand='.'
-	lines: List[str] = []
-	for f in merged:
-		mfields = list(f.fields)
-		chrom, start, end = mfields[0], int(mfields[1]), int(mfields[2])
-		name = mfields[3] if len(mfields) >= 4 and mfields[3] else "."
-		lines.append(f"{chrom}\t{start}\t{end}\t{name}\t0\t.")
-	return _bedtool_from_lines(lines)
-
-
-def _compute_stats(bt: BedTool, genome: str) -> Dict[str, float]:
+def _compute_stats(bt: BedTool, genome: str, custom_cache_dir: Optional[Path] = None) -> Dict[str, float]:
 	"""Compute stats for a BedTool (assumes at least bed3 columns present).
 
 	Returns keys: count, total_bp, mean_bp, median_bp, genome_size_bp, percent_genome
@@ -103,7 +326,7 @@ def _compute_stats(bt: BedTool, genome: str) -> Dict[str, float]:
 	mean_bp = float(mean(lens)) if lens else 0.0
 	median_bp = float(median(lens)) if lens else 0.0
 
-	chromsizes = bf.fetch_chromsizes(genome)
+	chromsizes = _get_cached_chromsizes(genome, custom_cache_dir)
 	# chromsizes is a pandas Series; use sum() for total genome size
 	try:
 		genome_size_bp = int(chromsizes.sum())
@@ -186,7 +409,7 @@ def _build_adaptive_from_roi(
 	clamp_warnings: List[str] = []
 
 	for f in bt_roi6:
-		fields = list(f.fields)
+		fields = f.fields
 		chrom, a, b = fields[0], int(fields[1]), int(fields[2])
 		name = fields[3] if len(fields) >= 4 and fields[3] else "."
 		chrom_size = chromsizes.get(chrom)
@@ -263,6 +486,13 @@ class PipelineOutputs:
 	buffer_size_used: int
 	global_cap_applied: bool
 	clamp_warnings: List[str]
+	repeat_regions_count: int = 0
+	repeat_bases_masked: int = 0
+	repeat_warnings: List[str] = None
+	
+	def __post_init__(self):
+		if self.repeat_warnings is None:
+			self.repeat_warnings = []
 
 
 def run_pipeline(
@@ -271,6 +501,9 @@ def run_pipeline(
 	buffer_size: int,
 	ignore_cap: bool,
 	strand_aware_buffer: bool,
+	mask_repeats: bool = False,
+	chunk_size: int = 400,
+	custom_cache_dir: Optional[Path] = None,
 ) -> PipelineOutputs:
 	"""Execute the full pipeline and return BedTools and stats.
 
@@ -284,13 +517,13 @@ def run_pipeline(
 	bt_raw = BedTool(str(input_bed_path))
 	bt6 = _bedtool_from_lines(_to_bed6_lines(bt_raw))
 	roi_bed6 = _merge_roi_bed6(bt6)
-	roi_stats = _compute_stats(roi_bed6, genome=genome)
+	roi_stats = _compute_stats(roi_bed6, genome=genome, custom_cache_dir=custom_cache_dir)
 
 	# Apply global cap based on ROI stats
 	buffer_to_use, cap_applied = _cap_buffer_globally(roi_bed6, buffer_size, ignore_cap)
 
 	# Fetch chromsizes once for clamping and pass to builder
-	chromsizes_series = bf.fetch_chromsizes(genome)
+	chromsizes_series = _get_cached_chromsizes(genome, custom_cache_dir)
 	# Normalize values to int for safety (Series -> dict)
 	chromsizes_int: Dict[str, int] = {str(k): int(v) for k, v in chromsizes_series.items()}
 	adaptive_bed6, clamp_warnings = _build_adaptive_from_roi(
@@ -298,12 +531,76 @@ def run_pipeline(
 	)
 	# Compute stats without double-counting ROI bases: use unstranded union if strand-aware
 	if strand_aware_buffer:
-		# Convert to bed3 lines and merge to union coverage
+		# Convert to bed3 lines and merge to union coverage using bioframe
 		bed3_lines: List[str] = [f"{f.chrom}\t{int(f.start)}\t{int(f.end)}" for f in adaptive_bed6]
-		union_bt = _bedtool_from_lines(bed3_lines).sort().merge()
-		adaptive_stats = _compute_stats(union_bt, genome=genome)
+		bed3_df = _bedframe_from_bedtool(_bedtool_from_lines(bed3_lines))
+		merged_df = bf.merge(bed3_df)
+		merged_df = bf.sort_bedframe(merged_df)
+		union_bt = _bedtool_from_bedframe(merged_df)
+		adaptive_stats = _compute_stats(union_bt, genome=genome, custom_cache_dir=custom_cache_dir)
 	else:
-		adaptive_stats = _compute_stats(adaptive_bed6, genome=genome)
+		adaptive_stats = _compute_stats(adaptive_bed6, genome=genome, custom_cache_dir=custom_cache_dir)
+
+	# Handle repeat masking
+	repeat_regions_count = 0
+	repeat_bases_masked = 0
+	repeat_warnings = []
+	
+	if mask_repeats:
+		try:
+			repeats_bed = _load_repeatmasker_bed(genome, min_size=chunk_size, custom_cache_dir=custom_cache_dir)
+			repeat_regions_count = len(repeats_bed)
+			
+			# Check for overlaps using bioframe
+			print("Checking for overlaps between adaptive regions and repeats...")
+			adaptive_df = _bedframe_from_bedtool(adaptive_bed6)
+			repeats_df = _bedframe_from_bedtool(repeats_bed)
+			overlaps_df = bf.overlap(adaptive_df, repeats_df)
+			overlapping_regions = len(overlaps_df)
+			print(f"Found {overlapping_regions:,} overlapping regions")
+			
+			if overlapping_regions > 0:
+				# Mask the repeats
+				adaptive_bed6, repeat_bases_masked = _mask_repeats_in_bed(adaptive_bed6, repeats_bed)
+				repeat_warnings.append(
+					f"Masked {overlapping_regions} regions overlapping repeats, "
+					f"{repeat_bases_masked} bases removed from adaptive BED."
+				)
+				# Recompute stats after masking
+				if strand_aware_buffer:
+					bed3_lines = [f"{f.chrom}\t{int(f.start)}\t{int(f.end)}" for f in adaptive_bed6]
+					bed3_df = _bedframe_from_bedtool(_bedtool_from_lines(bed3_lines))
+					merged_df = bf.merge(bed3_df)
+					merged_df = bf.sort_bedframe(merged_df)
+					union_bt = _bedtool_from_bedframe(merged_df)
+					adaptive_stats = _compute_stats(union_bt, genome=genome)
+				else:
+					adaptive_stats = _compute_stats(adaptive_bed6, genome=genome)
+			else:
+				repeat_warnings.append("No overlaps with repeat regions found.")
+		except Exception as e:
+			repeat_warnings.append(f"Failed to process repeat data: {e}")
+	else:
+		# Still check for potential issues without masking
+		try:
+			repeats_bed = _load_repeatmasker_bed(genome, min_size=chunk_size, custom_cache_dir=custom_cache_dir)
+			repeat_regions_count = len(repeats_bed)
+			
+			# Check for overlaps using bioframe
+			print("Checking for overlaps between adaptive regions and repeats (warning only)...")
+			adaptive_df = _bedframe_from_bedtool(adaptive_bed6)
+			repeats_df = _bedframe_from_bedtool(repeats_bed)
+			overlaps_df = bf.overlap(adaptive_df, repeats_df)
+			overlapping_regions = len(overlaps_df)
+			print(f"Found {overlapping_regions:,} overlapping regions")
+			
+			if overlapping_regions > 0:
+				repeat_warnings.append(
+					f"Warning: {overlapping_regions} regions overlap with repeats. "
+					"Use --mask-repeat-regions to remove them."
+				)
+		except Exception as e:
+			repeat_warnings.append(f"Failed to check repeat data: {e}")
 
 	return PipelineOutputs(
 		roi_bed6=roi_bed6,
@@ -313,5 +610,8 @@ def run_pipeline(
 		buffer_size_used=buffer_to_use,
 		global_cap_applied=cap_applied,
 		clamp_warnings=clamp_warnings,
+		repeat_regions_count=repeat_regions_count,
+		repeat_bases_masked=repeat_bases_masked,
+		repeat_warnings=repeat_warnings,
 	)
 

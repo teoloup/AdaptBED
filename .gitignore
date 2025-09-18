@@ -49,6 +49,9 @@ coverage.xml
 .hypothesis/
 .pytest_cache/
 
+# AdaptBED cache directory
+.adaptbed_cache/
+
 # Jupyter Notebook
 .ipynb_checkpoints
 
