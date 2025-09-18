@@ -1,6 +1,4 @@
 """
-BED processing utilities implemented exactly as specified.
-
 Pipeline steps:
 - Accept BED3/6/12 input and normalize to BED6 for processing (name if exists; score=0; strand as specified).
 - Parse, sort, and merge (not strand-aware) to produce the ROI BED (bed6) with strand set to '.'; keep names if present (distinct names collapsed).
@@ -22,7 +20,6 @@ Notes:
 """
 
 from __future__ import annotations
-
 from dataclasses import dataclass
 import math
 from pathlib import Path
